@@ -1,0 +1,96 @@
+#!/bin/sh
+# Generated for one release. Download and inspect this file before running it.
+set -eu
+
+# Keep piped installs from executing until the complete script has arrived.
+install_ssh_m8() (
+    set -eu
+    release_url='@RELEASE_URL@'
+    archive='@ARCHIVE@'
+    checksum='@SHA256@'
+    architecture='@ARCH@'
+    app_dir=${1:-"$HOME/Applications"}
+    bin_dir=${2:-"$HOME/.local/bin"}
+
+    fail() { printf '%s\n' "$*" >&2; exit 1; }
+    [ "$#" -le 2 ] || fail 'Usage: sh install.sh [absolute-app-directory] [absolute-cli-directory]'
+    [ "$(uname -s)" = Darwin ] || fail 'ssh-m8 requires macOS.'
+    [ "$(uname -m)" = "$architecture" ] || fail "This download requires $architecture. Use the installer for your Mac's architecture."
+    [ "$(sw_vers -productVersion | cut -d . -f 1)" -ge 12 ] || fail 'ssh-m8 requires macOS 12 or later.'
+    case "$app_dir:$bin_dir" in /*:/*) ;; *) fail 'Installation directories must be absolute paths.' ;; esac
+    app="$app_dir/ssh-m8.app"
+    link="$bin_dir/ssh-m8"
+    check_destination() {
+        [ ! -L "$app" ] || fail "Refusing to replace a symlink: $app"
+        if [ -e "$app" ]; then
+            identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null || true)
+            [ "$identifier" = local.ssh-m8 ] || fail "Refusing to replace an unrelated item: $app"
+            if pgrep -x ssh-m8 >/dev/null; then
+                fail 'Quit ssh-m8 before updating. Quitting temporarily stops its tunnels.'
+            fi
+        fi
+        if [ -e "$link" ] || [ -L "$link" ]; then
+            [ -L "$link" ] && [ "$(readlink "$link")" = "$app/Contents/MacOS/ssh-m8" ] || fail "An unrelated CLI already exists: $link"
+        fi
+    }
+    check_destination
+
+    work=$(mktemp -d "${TMPDIR:-/tmp}/ssh-m8-download.XXXXXX")
+    stage=''
+    replaced=false
+    linked=false
+    complete=false
+    cleanup() {
+        if [ "$complete" = false ] && [ "$linked" = true ] && [ -L "$link" ]; then
+            [ "$(readlink "$link")" != "$app/Contents/MacOS/ssh-m8" ] || rm "$link"
+        fi
+        if [ "$complete" = false ] && [ "$replaced" = true ]; then
+            rm -rf "$app"
+        fi
+        if [ "$complete" = false ] && [ -n "$stage" ] && [ -d "$stage/previous.app" ]; then
+            if ! mv "$stage/previous.app" "$app"; then
+                printf 'Restore the previous app from: %s/previous.app\n' "$stage" >&2
+                stage=''
+            fi
+        fi
+        rm -rf "$work"
+        [ -z "$stage" ] || rm -rf "$stage"
+    }
+    trap cleanup EXIT
+    trap 'exit 1' HUP INT TERM
+    printf 'Downloading ssh-m8…\n'
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        "$release_url/$archive" -o "$work/app.zip"
+    actual=$(shasum -a 256 "$work/app.zip" | cut -d ' ' -f 1)
+    [ "$actual" = "$checksum" ] || fail 'Download checksum mismatch. Nothing was installed.'
+    ditto -x -k "$work/app.zip" "$work/unpacked"
+    downloaded="$work/unpacked/ssh-m8.app"
+    [ -x "$downloaded/Contents/MacOS/ssh-m8" ] || fail 'The download does not contain ssh-m8.'
+    identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$downloaded/Contents/Info.plist")
+    [ "$identifier" = local.ssh-m8 ] || fail 'Unexpected app identifier. Nothing was installed.'
+    codesign --verify --deep --strict "$downloaded"
+
+    # curl does not mark downloads for Gatekeeper, so retain that first-open check.
+    quarantine="0083;$(printf '%x' "$(date +%s)");ssh-m8;"
+    xattr -w -r com.apple.quarantine "$quarantine" "$downloaded"
+    mkdir -p "$app_dir" "$bin_dir"
+    stage=$(mktemp -d "$app_dir/.ssh-m8-install.XXXXXX")
+    ditto "$downloaded" "$stage/ssh-m8.app"
+    check_destination
+    if [ -e "$app" ]; then
+        mv "$app" "$stage/previous.app"
+    fi
+    replaced=true
+    mv "$stage/ssh-m8.app" "$app"
+    if [ ! -L "$link" ]; then
+        linked=true
+        ln -s "$app/Contents/MacOS/ssh-m8" "$link"
+    fi
+    complete=true
+    printf 'Installed %s\nCLI: %s\n' "$app" "$link"
+    case ":$PATH:" in *":$bin_dir:"*) ;; *) printf 'Add %s to your PATH to use the CLI.\n' "$bin_dir" ;; esac
+    printf 'Open ssh-m8 from Applications when ready.\n'
+    printf 'This release is not notarised. macOS may require Open Anyway in System Settings > Privacy & Security.\n'
+    printf 'Saved hosts, tunnels, and credentials have not been changed.\n'
+)
+install_ssh_m8 "$@"
